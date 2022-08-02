@@ -92,15 +92,17 @@ public class HikariDataSource extends HikariConfig implements DataSource, Closea
    @Override
    public Connection getConnection() throws SQLException
    {
+      // AtomicBoolean isShutdown
       if (isClosed()) {
          throw new SQLException("HikariDataSource " + this + " has been closed.");
       }
-
+      // 使用默认 HikariDataSource 时，fastPathPool == null
       if (fastPathPool != null) {
          return fastPathPool.getConnection();
       }
 
       // See http://en.wikipedia.org/wiki/Double-checked_locking#Usage_in_Java
+      // 双重检查锁
       HikariPool result = pool;
       if (result == null) {
          synchronized (this) {
@@ -110,6 +112,7 @@ public class HikariDataSource extends HikariConfig implements DataSource, Closea
                LOGGER.info("{} - Starting...", getPoolName());
                try {
                   pool = result = new HikariPool(this);
+                  // this.sealed = true
                   this.seal();
                }
                catch (PoolInitializationException pie) {

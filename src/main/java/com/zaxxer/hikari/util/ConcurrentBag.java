@@ -72,9 +72,13 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
 
    public interface IConcurrentBagEntry
    {
+      // 未使用
       int STATE_NOT_IN_USE = 0;
+      // 使用
       int STATE_IN_USE = 1;
+      // 删除
       int STATE_REMOVED = -1;
+      // 保留
       int STATE_RESERVED = -2;
 
       boolean compareAndSet(int expectState, int newState);
@@ -136,6 +140,7 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
          for (T bagEntry : sharedList) {
             if (bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
                // If we may have stolen another waiter's connection, request another bag add.
+               // waiting 值越大， 说明并发数越高， 所以需要无脑创建 连接
                if (waiting > 1) {
                   listener.addBagItem(waiting - 1);
                }
@@ -177,17 +182,25 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
       bagEntry.setState(STATE_NOT_IN_USE);
 
       for (int i = 0; waiters.get() > 0; i++) {
+         // return 表示归还失败。
+         // 什么时候会执行 return？
+         // bagEntry.getState == STATE_IN_USE 被使用了
+         // bagEntry.getState == STATE_NOT_IN_USE， 并且扔到队列， 被其他线程取走了
          if (bagEntry.getState() != STATE_NOT_IN_USE || handoffQueue.offer(bagEntry)) {
             return;
          }
+         // 循环次数太多了！！！
+         // 0xff = 1111 1111 = 255 = 1 2 4 8 16 32 64 128
          else if ((i & 0xff) == 0xff) {
             parkNanos(MICROSECONDS.toNanos(10));
          }
+         // 此链接没有其他线程需要使用。可以歇一会。
          else {
             Thread.yield();
          }
       }
 
+      // 当连接没人用的时候， 再归还给上次占用的线程
       final List<Object> threadLocalList = threadList.get();
       if (threadLocalList.size() < 50) {
          threadLocalList.add(weakThreadLocals ? new WeakReference<>(bagEntry) : bagEntry);
@@ -209,7 +222,15 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
       sharedList.add(bagEntry);
 
       // spin until a thread takes it or none are waiting
+      // 什么时候会跳出循环？
+      // 1. 没有线程等待获取连接（上面刚 add 完， 就被其他线程拿走了）
+      // 2. 上面新添加的连接已经被占用了
+      // 3. 上面新添加的连接被其他线程从队列中取走了
+
+      // handoffQueue： 必须先调用 poll 方法，才能使用off, 也就是在你放入元素前， 必须有个线程在等着取元素了
       while (waiters.get() > 0 && bagEntry.getState() == STATE_NOT_IN_USE && !handoffQueue.offer(bagEntry)) {
+         // 让当前线程从运行状态 转为 就绪状态，以允许具有相同优先级的其他线程获得运行机会
+         // 其实可以简单理解为 sleep 了一会。暂时放弃 CPU 的执行权， 还是会回来的。
          Thread.yield();
       }
    }
@@ -225,6 +246,10 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
     */
    public boolean remove(final T bagEntry)
    {
+      // 什么情况下，能成功 remove
+      // 1. bagEntry.compareAndSet(STATE_IN_USE, STATE_REMOVED) == true
+      // 2. bagEntry.compareAndSet(STATE_RESERVED, STATE_REMOVED) == true
+      // 3. closed
       if (!bagEntry.compareAndSet(STATE_IN_USE, STATE_REMOVED) && !bagEntry.compareAndSet(STATE_RESERVED, STATE_REMOVED) && !closed) {
          LOGGER.warn("Attempt to remove an object from the bag that was not borrowed or reserved: {}", bagEntry);
          return false;
@@ -390,5 +415,38 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
       catch (SecurityException se) {
          return true;
       }
+   }
+
+   public static void main(String[] args) throws InterruptedException {
+      SynchronousQueue<String> queue = new SynchronousQueue<>(true);
+
+      Thread t1 = new Thread(() -> {
+         System.out.println("11111");
+         while (true) {
+            String poll = null;
+            try {
+               poll = queue.poll(1100, TimeUnit.MILLISECONDS);
+               // poll = queue.take();
+            } catch (InterruptedException e) {
+               e.printStackTrace();
+            }
+            if (poll != null) {
+               System.out.println("poll => " + poll);
+            }
+         }
+      });
+      Thread.sleep(1000);
+      Thread t2 = new Thread(() -> {
+         System.out.println("22222");
+         while (true)
+            if (queue.offer("1")) {
+               System.out.println("offer");
+               break;
+            }
+
+      });
+      t1.start();
+      t2.start();
+      Thread.sleep(10000);
    }
 }
