@@ -644,6 +644,7 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
     */
    private boolean softEvictConnection(final PoolEntry poolEntry, final String reason, final boolean owner)
    {
+      // 打上 evicted 标记
       poolEntry.markEvicted();
       if (owner || connectionBag.reserve(poolEntry)) {
          closeConnection(poolEntry, reason);
@@ -890,12 +891,20 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
 
       public void run()
       {
+         // 先把状态从 STATE_NOT_IN_USE 置为 RESERVED
          if (connectionBag.reserve(poolEntry)) {
+            // 如果连接死了， 就直接断开连接
             if (!isConnectionAlive(poolEntry.connection)) {
                softEvictConnection(poolEntry, DEAD_CONNECTION_MESSAGE, true);
                addBagItem(connectionBag.getWaitingThreadCount());
             }
+            // 如果连接还活着，就 RESERVED 置为 STATE_NOT_IN_USE
             else {
+               // 什么情况下， 这里会一直阻塞在这里，就相当于 KeepaliveTask 不执行了， 少个人监控连接是否活着了。
+
+               // 反推一下： 什么情况下， 不阻塞：
+               // * 有线程取走连接，那么我们肯定得监视一下啊， 防止它突然死了， 不能用了。
+               // * 没有那么多并发， 那我们也得监视一下啊，防止有过多连接活跃，
                connectionBag.unreserve(poolEntry);
                logger.debug("{} - keepalive: connection {} is alive", poolName, poolEntry.connection);
             }
@@ -916,4 +925,7 @@ public final class HikariPool extends PoolBase implements HikariPoolMXBean, IBag
          super("Failed to initialize pool: " + t.getMessage(), t);
       }
    }
+
+
+
 }

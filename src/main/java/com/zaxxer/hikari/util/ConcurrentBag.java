@@ -70,6 +70,13 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
 
    private final SynchronousQueue<T> handoffQueue;
 
+   // add         new             -> STATE_NOT_IN_USE
+   // borrow    STATE_NOT_IN_USE  -> STATE_IN_USE
+   // requite   STATE_IN_USE      -> STATE_NOT_IN_USE
+   // remove    STATE_IN_USE      -> STATE_REMOVED
+   // remove    STATE_RESERVED    -> STATE_REMOVED
+   // reserve   STATE_NOT_IN_USE  -> STATE_RESERVED
+   // unreserve STATE_RESERVED    -> STATE_NOT_IN_USE
    public interface IConcurrentBagEntry
    {
       // 未使用
@@ -141,6 +148,10 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
             if (bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
                // If we may have stolen another waiter's connection, request another bag add.
                // waiting 值越大， 说明并发数越高， 所以需要无脑创建 连接
+
+               // 当线程走到这里, com.zaxxer.hikari.util.ConcurrentBag.unreserve() ：
+               // waiting > 1 && handoffQueue.offer() == false
+               // KeepaliveTask 阻塞
                if (waiting > 1) {
                   listener.addBagItem(waiting - 1);
                }
@@ -153,6 +164,17 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
          timeout = timeUnit.toNanos(timeout);
          do {
             final long start = currentTime();
+            // 当线程走到这里, com.zaxxer.hikari.util.ConcurrentBag.unreserve() 就不会阻塞：
+            // waiting > 1 && handoffQueue.offer() == true
+            // waiting = 0 && handoffQueue.offer() == true
+
+            // 什么情况下会走到这里：
+            // sharedList 里面的连接全被占用了， 已经通知线程取增加新的连接了。
+
+            // 反推， 什么情况下， 不走这里：
+            // sharedList 里面的连接没有被占用完， 。
+            // 与此同时， 如果等待获取线程的连接有点多时， com.zaxxer.hikari.util.ConcurrentBag.unreserve() 就会阻塞
+            // 因此 KeepaliveTask 定时任务暂时不执行。
             final T bagEntry = handoffQueue.poll(timeout, NANOSECONDS);
             if (bagEntry == null || bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
                return bagEntry;
@@ -330,8 +352,10 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
    @SuppressWarnings("SpellCheckingInspection")
    public void unreserve(final T bagEntry)
    {
+      // 保留 -> 空闲
       if (bagEntry.compareAndSet(STATE_RESERVED, STATE_NOT_IN_USE)) {
          // spin until a thread takes it or none are waiting
+         // 如果有很多线程在等待获取连接，并且没有线程从队列里面取连接
          while (waiters.get() > 0 && !handoffQueue.offer(bagEntry)) {
             Thread.yield();
          }
